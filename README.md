@@ -136,6 +136,36 @@ silent on 26 of 55 requests, which is worse, so a reply that is all repeats is
 now said. The remaining fix is a model that follows "never say the same thing
 twice"; there is no VRAM left beside gemma to try one alongside it.
 
+## Other models for the repetition (2026-10-07)
+
+`eval_model.py` feeds candidate lines to the shim as text (no speech, no
+real-time playback) and answers tools the way CodeTrial does, hint ladder
+included: two rungs, then "withheld". Two scripts: a 20-line Two Sum interview,
+and "I'm stuck. Can I get a hint?" 30 times. Results in `eval-results.jsonl`.
+
+| Model (llama-server, thinking off) | realistic: repeats / hints logged / first sentence | 30x same request: repeats / hints logged |
+|---|---|---|
+| gemma-4-12b Q4_K_M | 0% / 3 of 5 / 488 ms | 72% / 3 of 31 |
+| gemma-4-12b, DRY 0.8 (`--sampling`) | 0% / 3 of 5 / 653 ms | 47% / 1 of 31 |
+| Qwen3.5-9B Q6_K | 2% / 1 of 5 / 479 ms | 41% / 1 of 31 |
+| Qwen3-14B Q4_K_M, 36 of 41 layers on GPU | 0% / 4 of 5 / 2,280 ms | 73% / 3 of 31 |
+
+- In an ordinary interview none of them repeats; the repetition is the
+  candidate asking the same thing over and over, after the ladder is spent.
+- Qwen3.5-9B is worse at the job: it named the hash map unasked, said "I can
+  only provide one hint per session", and closed the interview early.
+- Qwen3-14B follows the hint rules best, saying each rung as given, but does
+  not fit beside whisper, Kokoro and the other 4 GB process: partly on the CPU
+  it takes 2.3 s to the first sentence, and on the repeated request it said
+  "What would you try first, even if it's a slow approach?" 27 times word for
+  word.
+- DRY turns the verbatim repeats into paraphrases (72% to 47%) but they say
+  the same thing.
+- Every model stops calling `log_hint` once the ladder is spent and answers
+  the request itself, so CodeTrial no longer counts it.
+
+So a different model that fits does not fix it. gemma stays.
+
 ## Caveats
 
 - The candidate speech is Kokoro-synthesized: clean, no accent, no room noise.

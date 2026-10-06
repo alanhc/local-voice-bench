@@ -409,7 +409,8 @@ class Session:
 
     def request(self, messages: list[dict], stream: bool = False) -> dict:
         return {"messages": messages, "tools": self.tools, "temperature": 0.7, "max_tokens": 400,
-                "stream": stream, "stop": [THOUGHT_LOOP], "chat_template_kwargs": {"enable_thinking": False}}
+                "stream": stream, "stop": [THOUGHT_LOOP], "chat_template_kwargs": {"enable_thinking": False},
+                **self.args.sampling}
 
     async def complete(self, messages: list[dict]) -> tuple[str, list[dict]]:
         response = await self.http.post(f"{self.args.llm}/v1/chat/completions", json=self.request(messages))
@@ -591,6 +592,8 @@ async def main() -> None:
     parser.add_argument("--listen", default="127.0.0.1:8191")
     parser.add_argument("--llm", default="http://127.0.0.1:8180", help="llama-server base URL")
     parser.add_argument("--voice", default="am_michael", help="Kokoro voice")
+    parser.add_argument("--sampling", type=json.loads, default={},
+                        help='extra llama-server sampling fields, e.g. \'{"dry_multiplier": 0.8}\'')
     args = parser.parse_args()
     models = Models(args.voice)
     sessions: dict[str, list] = {}
