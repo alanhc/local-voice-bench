@@ -30,6 +30,56 @@ in CodeTrial, which Gemini Live waits too):
 - the session's first turn: ~2.2 s cold, avoidable by prefilling the
   instructions when the session opens, before the candidate speaks
 
+## Stage 1: a whole interview without Google (2026-10-06)
+
+`live_shim.py` answers Gemini Live's `BidiGenerateContent` socket from Silero
+VAD, faster-whisper, llama-server and Kokoro. With CodeTrial's
+`CODETRIAL_GEMINI_LIVE_URL` (local branch `local-voice` in the
+`codetrial-voice` worktree, on top of #110) and `CODETRIAL_GEMINI_REST_BASE`,
+and LiveKit's own `livekit-server --dev`, nothing in an interview reaches
+Google or LiveKit Cloud.
+
+Checked with CodeTrial's own `scripts/browser-check.sh`, `BROWSER_CHECK_AGENT=dispatch`:
+
+| Flow | Result |
+|---|---|
+| `report` | Greeting, test run, the interviewer reacting to the failed tests, end, report from gemma (0/0 NO_HIRE, summary true to an empty session) |
+| `barge`, candidate audio from a WAV | Candidate speech through LiveKit, transcribed in 167 ms |
+| `soak`, 11 minutes, "I'm stuck, can I get a hint?" every 35 s | 18 of 18 requests heard, 18 `log_hint` calls, 32 interviewer turns, none failed; first audio a median 1.63 s and at most 2.91 s after the input was complete. The flow itself fails at the end, on "no transport restart", which only Gemini's ten-minute socket cap causes |
+
+Found on the way:
+
+- Silero v5 through ONNX needs the 64 samples before each frame prepended;
+  without them it scores clear speech under 0.05 and nothing is ever heard.
+  Stage 0 measured its speed and missed this.
+- gemma-4-12b repeats itself: the same hint sentence, nearly word for word,
+  several times in the soak, against the prompt's "never say the same thing
+  twice".
+- A silence-nudge event and the candidate's request often land together, and
+  the interviewer answers both, back to back.
+- Hint turns take 1.9 to 2.9 s, slower than stage 0's 1.1 s estimate: two LLM
+  calls, whole-sentence TTS before sending, and one GPU lock for all three
+  models.
+
+Not done in stage 1: barge-in (the microphone is ignored while the
+interviewer speaks), latency work, any real human speech.
+
+### Run one yourself
+
+```bash
+~/.local/livekit/livekit-server --dev --bind 127.0.0.1 --node-ip 127.0.0.1 &
+source env.sh && .venv/bin/python live_shim.py --listen 127.0.0.1:8191 --llm http://127.0.0.1:8180 &
+# in the codetrial-voice worktree, config/codetrial.env.local holding
+# LIVEKIT_URL=ws://127.0.0.1:7880, LIVEKIT_API_KEY=devkey,
+# LIVEKIT_API_SECRET=secret, GOOGLE_API_KEY=local
+CODETRIAL_GEMINI_LIVE_URL=ws://127.0.0.1:8191/live \
+CODETRIAL_GEMINI_REST_BASE=http://127.0.0.1:8190 \
+CXX=$HOME/.local/clang-webrtc/bin/clang++ cargo run -- web
+```
+
+The report also needs CodeTrial's `scripts/gemini-shim.py --thinking off` on
+8190 in front of the same llama-server.
+
 ## Caveats
 
 - The candidate speech is Kokoro-synthesized: clean, no accent, no room noise.
