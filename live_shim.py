@@ -7,8 +7,10 @@ from parts that run on one GPU:
     candidate audio -> Silero VAD -> faster-whisper -> llama-server -> Kokoro -> audio
 
 Stage 1 of the plan in README.md: enough for a whole interview, nothing more.
-There is no barge-in: while the interviewer is speaking, the candidate's
-microphone is not listened to. Point CodeTrial at it with
+Speech that lasts while the interviewer has the floor interrupts it, as
+Live's START_OF_ACTIVITY_INTERRUPTS does: generation stops, `interrupted` goes
+out, and the history keeps only what the candidate actually heard. Point
+CodeTrial at it with
 
     CODETRIAL_GEMINI_LIVE_URL=ws://127.0.0.1:8191/live
 
@@ -44,6 +46,22 @@ VAD_CONTEXT = 64
 SPEECH_PROBABILITY = 0.5
 PRE_ROLL_FRAMES = 10  # keep ~320 ms before speech starts, so the first word is whole
 ECHO_GUARD = 0.3  # seconds after the interviewer's audio ends before listening again
+# While the interviewer has the floor, speech has to last this many frames
+# (~190 ms) before it takes the floor: a cough or the tail of the interviewer's
+# own voice leaking past echo cancellation should not cut a reply off.
+BARGE_FRAMES = 6
+# How long a turn waits for a candidate who is mid-sentence when it is due, so
+# that their words and a platform event that arrived meanwhile are answered as
+# one turn instead of two back to back. A bound against a stuck microphone, not
+# a measure of a sentence: eight seconds cut off a nine-second answer.
+MERGE_WAIT = 30.0
+# Always given to whisper beside the problem's own vocabulary, which is its
+# title and the starter's identifiers. Without them "O of n squared" came back
+# as "O ,".
+INTERVIEW_HOTWORDS = [
+    "O of n", "O of n squared", "O of one", "O of log n", "O of n log n",
+    "hash map", "dictionary", "two pointers", "binary search", "edge case",
+]
 AUDIO_CHUNK = OUT_RATE // 5  # 200 ms of output audio per message
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
@@ -119,6 +137,12 @@ class Session:
         self.tool_waiters: dict[str, asyncio.Future] = {}
         self.speaking_until = 0.0
         self.busy = False
+        self.turn_task: asyncio.Task | None = None
+        # This turn's sentences as the room plays them: (text, start, end,
+        # index of their assistant message, or None while still generating).
+        self.played: list[list] = []
+        self.barge_frames = 0
+        self.transcribing = 0
         # VAD
         self.vad_state = np.zeros((2, 1, 128), dtype=np.float32)
         self.vad_context = np.zeros(VAD_CONTEXT, dtype=np.float32)
@@ -145,7 +169,7 @@ class Session:
         detection = setup.get("realtimeInputConfig", {}).get("automaticActivityDetection", {})
         self.silence_ms = int(detection.get("silenceDurationMs", self.silence_ms))
         vocabulary = setup.get("inputAudioTranscription", {}).get("customVocabulary") or []
-        self.hotwords = ", ".join(vocabulary) or None
+        self.hotwords = ", ".join([*vocabulary, *INTERVIEW_HOTWORDS])
 
         handle = (setup.get("sessionResumption") or {}).get("handle")
         if handle and handle in self.sessions:
@@ -188,12 +212,21 @@ class Session:
         })
         self.vad_context = frame[-VAD_CONTEXT:]
         speech = float(probability[0][0]) > SPEECH_PROBABILITY
-        listening = not self.busy and time.monotonic() > self.speaking_until + ECHO_GUARD
+        floor = self.busy or time.monotonic() < self.speaking_until + ECHO_GUARD
         if not self.utterance:
             self.pre_roll = (self.pre_roll + [frame])[-PRE_ROLL_FRAMES:]
-            if speech and listening:
-                self.utterance = list(self.pre_roll)
-                self.silent_frames = 0
+            if not speech:
+                self.barge_frames = 0
+                return
+            if floor:
+                # The interviewer has the floor: only sustained speech takes it.
+                self.barge_frames += 1
+                if self.barge_frames < BARGE_FRAMES:
+                    return
+                self.barge_frames = 0
+                await self.interrupt()
+            self.utterance = list(self.pre_roll)
+            self.silent_frames = 0
             return
         self.utterance.append(frame)
         self.silent_frames = 0 if speech else self.silent_frames + 1
@@ -204,8 +237,12 @@ class Session:
 
     async def on_utterance(self, audio: np.ndarray) -> None:
         heard_at = time.perf_counter()
-        async with self.models.gpu:
-            text = await asyncio.to_thread(self.models.transcribe, audio, self.hotwords)
+        self.transcribing += 1
+        try:
+            async with self.models.gpu:
+                text = await asyncio.to_thread(self.models.transcribe, audio, self.hotwords)
+        finally:
+            self.transcribing -= 1
         if not text:
             return
         log(self.id, f"heard ({len(audio) / IN_RATE:.1f}s, {1000 * (time.perf_counter() - heard_at):.0f} ms): {text}")
@@ -217,13 +254,69 @@ class Session:
     async def turns(self) -> None:
         while True:
             text, started = await self.inputs.get()
+            # A candidate mid-sentence is finishing what this turn should
+            # answer: wait for their words and take everything waiting as one
+            # input, the way Live reads text and audio as one stream.
+            deadline = time.monotonic() + MERGE_WAIT
+            while (self.utterance or self.transcribing) and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            merged = 1
+            while not self.inputs.empty():
+                more, more_started = self.inputs.get_nowait()
+                text, started, merged = f"{text}\n{more}", max(started, more_started), merged + 1
+            if merged > 1:
+                log(self.id, f"answering {merged} inputs as one turn")
             self.busy = True
-            try:
-                await self.turn(text, started)
-            except Exception as error:
+            self.played = []
+            self.turn_task = asyncio.create_task(self.turn(text, started))
+            await asyncio.wait({self.turn_task})
+            if not self.turn_task.cancelled() and self.turn_task.exception():
+                error = self.turn_task.exception()
                 log(self.id, f"turn failed: {type(error).__name__}: {error}")
-            finally:
-                self.busy = False
+            self.busy = False
+
+    async def interrupt(self) -> None:
+        """The candidate spoke over the interviewer: stop, say so, and keep in
+        the history only the sentences the room had started playing."""
+        now = time.monotonic()
+        task = self.turn_task
+        generating = task is not None and not task.done()
+        if generating:
+            task.cancel()
+            await asyncio.wait({task})
+        heard = [entry for entry in self.played if entry[1] <= now]
+        unheard = [entry for entry in self.played if entry[1] > now]
+        if not generating and not unheard and now >= self.speaking_until:
+            return  # nothing of the interviewer's was still going
+        self.repair_history(heard, unheard, generating)
+        self.played = []
+        self.speaking_until = now
+        await self.send({"serverContent": {"interrupted": True}})
+        if generating:
+            await self.send({"serverContent": {"turnComplete": True}})
+        log(self.id, f"interrupted: {len(heard)} sentence(s) heard, {len(unheard)} cut")
+
+    def repair_history(self, heard, unheard, generating) -> None:
+        # Sentences already in an assistant message that never played come out
+        # of it; sentences that played but whose generation was cancelled
+        # before it was recorded go in as one message.
+        for index in {entry[3] for entry in unheard if entry[3] is not None}:
+            kept = [entry[0] for entry in heard if entry[3] == index]
+            self.messages[index]["content"] = " ".join(kept)
+        pending = [entry[0] for entry in heard if entry[3] is None]
+        if generating and pending:
+            self.messages.append({"role": "assistant", "content": " ".join(pending)})
+        # A tool call left without its answer would make the next request
+        # invalid, so it gets one.
+        last_calls = next(
+            (i for i in range(len(self.messages) - 1, -1, -1) if self.messages[i].get("tool_calls")), None
+        )
+        if last_calls is not None:
+            answered = {m.get("tool_call_id") for m in self.messages[last_calls + 1:] if m["role"] == "tool"}
+            for call in self.messages[last_calls]["tool_calls"]:
+                if call["id"] not in answered:
+                    self.messages.append({"role": "tool", "tool_call_id": call["id"],
+                                          "content": json.dumps({"result": "interrupted before it was answered"})})
 
     async def turn(self, text: str, started: float) -> None:
         self.messages.append({"role": "user", "content": text})
@@ -284,6 +377,9 @@ class Session:
                 for call in calls
             ]
         self.messages.append(message)
+        for entry in self.played:
+            if entry[3] is None:
+                entry[3] = len(self.messages) - 1
         return spoken_at, calls
 
     async def say(self, sentence: str) -> float | None:
@@ -301,7 +397,9 @@ class Session:
             }}]}}})
         # The room plays it out in real time; until then this is the
         # interviewer's turn, and the microphone hears the interviewer.
-        self.speaking_until = max(self.speaking_until, time.monotonic()) + len(audio) / OUT_RATE
+        start = max(self.speaking_until, time.monotonic())
+        self.speaking_until = start + len(audio) / OUT_RATE
+        self.played.append([sentence, start, self.speaking_until, None])
         log(self.id, f"said: {sentence}")
         return sent_at
 
