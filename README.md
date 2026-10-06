@@ -166,6 +166,30 @@ and "I'm stuck. Can I get a hint?" 30 times. Results in `eval-results.jsonl`.
 
 So a different model that fits does not fix it. gemma stays.
 
+## The shim logs hint requests itself (2026-10-07)
+
+When the candidate's words ask for a hint (`HINT_REQUEST`, with "don't need a
+hint" and the platform's bracketed events left out), the shim makes the
+`log_hint` call with `requested: true` before the model speaks, and the model
+answers from CodeTrial's result. A requested `log_hint` the model makes itself
+in that turn is answered by the shim and not sent on, so one request counts
+once. A hint request is not prepared during the silence, since its reply
+depends on the call's result.
+
+`eval_model.py`, gemma-4-12b (counts below leave out the greeting, which the
+first version of the script counted as a request because it mentions hints):
+
+| | before | after |
+|---|---|---|
+| ordinary interview, requests logged | 2 of 4 | **4 of 4** |
+| 30x same request, requests logged | 2 of 30 | **30 of 30** |
+| counted twice / counted unasked | not measured | 0 / 0 |
+| 30x same request, near-repeats | 72% | 49% |
+
+Repeats fell because CodeTrial's answer now arrives on every request and the
+model words around it, but the withheld answer is the same text each time, so
+what it says is still much the same. Varying that is CodeTrial's to do.
+
 ## Caveats
 
 - The candidate speech is Kokoro-synthesized: clean, no accent, no room noise.

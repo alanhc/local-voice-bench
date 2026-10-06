@@ -73,7 +73,7 @@ def words(sentence):
 async def run(lines, name):
     hints_given = 0
     sentences, firsts, logged, empties, leaks = [], [], 0, 0, 0
-    hint_requests = 0
+    hint_requests, doubled, unasked = 0, 0, 0
     async with websockets.connect(f"{URL}?key=local", max_size=None) as socket:
         await socket.send(json.dumps({"setup": {
             "systemInstruction": {"parts": [{"text": PROMPTS["instructions"]}]},
@@ -82,9 +82,9 @@ async def run(lines, name):
         }}))
         await socket.recv()
         for line in [PROMPTS["greeting"], *lines]:
-            asked = "hint" in line.lower()
+            asked = "hint" in line.lower() and not line.startswith("[")
             hint_requests += asked
-            called_hint = False
+            called_hint, requested_calls = False, 0
             started, first, said = time.perf_counter(), None, []
             await socket.send(json.dumps({"realtimeInput": {"text": line}}))
             while True:
@@ -102,6 +102,7 @@ async def run(lines, name):
                             result = EDITOR
                         elif call["name"] == "log_hint":
                             called_hint = called_hint or bool(call["args"].get("requested"))
+                            requested_calls += bool(call["args"].get("requested"))
                             if call["args"].get("requested"):
                                 if hints_given < len(RUNGS):
                                     hints_given += 1
@@ -115,6 +116,8 @@ async def run(lines, name):
                 if content.get("turnComplete"):
                     break
             logged += asked and called_hint
+            doubled += requested_calls > 1
+            unasked += requested_calls > 0 and not asked
             empties += not said
             leaks += any(re.search(r"<\|?channel|Platform note|\[SYSTEM", s) for s in said)
             if first:
@@ -133,6 +136,8 @@ async def run(lines, name):
         "sentences": len(sentences),
         "near_repeats": f"{near} ({100 * near / max(1, len(sentences)):.0f}%)",
         "hint_requests_logged": f"{logged}/{hint_requests}",
+        "counted_twice": doubled,
+        "counted_unasked": unasked,
         "empty_replies": empties,
         "markup_leaks": leaks,
         "first_sentence_median_ms": round(1000 * statistics.median(firsts)) if firsts else None,

@@ -72,6 +72,20 @@ INTERVIEW_HOTWORDS = [
     "O of n", "O of n squared", "O of one", "O of log n", "O of n log n",
     "hash map", "dictionary", "two pointers", "binary search", "edge case",
 ]
+# A candidate asking for a hint. CodeTrial counts hints through `log_hint`, which
+# the model is told to call before every requested clue; once the ladder is
+# spent every model tried stopped calling it and answered the request itself,
+# so the request went uncounted. The shim makes the call instead, before the
+# model speaks, and the model answers from its result.
+HINT_REQUEST = re.compile(
+    r"\b(?:(?:can|could|may) (?:i|you|we) (?:get|have|give(?: me)?|use)"
+    r"|(?:give|show) me|i(?:'d| would)? (?:like|want|need)|i could use|is there|got|any(?:thing)?(?: like)?)"
+    r"(?: (?:a|an|another|one|one more|some|any|a little|a small|more|other))*"
+    r" (?:hint|clue|nudge)s?\b"
+    r"|\b(?:another|one more|a) (?:hint|clue)(?:,)? please\b|^\s*(?:a |another )?hint\??\s*$",
+    re.I,
+)
+HINT_DECLINED = re.compile(r"\b(?:don't|do not|no|without|not)\b[^.?!]{0,20}\b(?:hint|clue|nudge)", re.I)
 AUDIO_CHUNK = OUT_RATE // 5  # 200 ms of output audio per message
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
@@ -82,6 +96,13 @@ SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 THOUGHT_BLOCK = "<|channel>thought\n<channel|>"
 THOUGHT_LOOP = "<channel|>" + THOUGHT_BLOCK * 2 + "<|channel>"
 THOUGHT_MARKUP = re.compile(r"<\|channel>.*?(?:<channel\|>|$)|<channel\|>", re.S)
+
+
+def asks_for_hint(text: str) -> bool:
+    """The candidate's own words ask for a hint. Lines in square brackets are
+    CodeTrial's platform events, which may mention hints themselves."""
+    said = [line for line in text.splitlines() if not line.lstrip().startswith("[")]
+    return any(HINT_REQUEST.search(line) and not HINT_DECLINED.search(line) for line in said)
 
 
 def log(session: str, message: str) -> None:
@@ -270,6 +291,10 @@ class Session:
         result = {"transcript": transcript, "stt_ms": 1000 * (time.perf_counter() - started)}
         if not transcript or self.busy or not self.inputs.empty():
             return result
+        if self.counts_hints() and asks_for_hint(transcript):
+            # Its reply comes from log_hint's result, which only the call
+            # itself can give, and the call cannot be made ahead.
+            return result
         base = len(self.messages)
         content, calls = await self.complete(self.messages + [{"role": "user", "content": transcript}])
         sentences = self.trim_repeats(self.sentences(content))
@@ -376,10 +401,24 @@ class Session:
                     self.messages.append({"role": "tool", "tool_call_id": call["id"],
                                           "content": json.dumps({"result": "interrupted before it was answered"})})
 
+    def counts_hints(self) -> bool:
+        return any(tool["function"]["name"] == "log_hint" for tool in self.tools)
+
+    async def log_requested_hint(self) -> None:
+        """Make the log_hint call the request needs, as if the model had,
+        so the model answers from the result."""
+        call = {"id": f"call-{uuid.uuid4().hex[:8]}", "name": "log_hint", "arguments": json.dumps({"requested": True})}
+        self.record([], [call])
+        await self.call_tools([call])
+
     async def turn(self, text: str, started: float, prepared: dict | None = None) -> None:
         self.messages.append({"role": "user", "content": text})
         first_audio = None
         more = True
+        logged = self.counts_hints() and asks_for_hint(text)
+        if logged:
+            log(self.id, "hint requested: logging it")
+            await self.log_requested_hint()
         usable = prepared is not None and prepared.get("base") == len(self.messages) - 1
         if usable:
             # Worked out during the silence against this same history: send it.
@@ -390,7 +429,7 @@ class Session:
             self.record([sentence for sentence, _ in prepared["sentences"]], calls)
             more = bool(calls)
             if calls:
-                await self.call_tools(calls)
+                await self.call_tools(calls, logged)
         for _ in range(4):
             if not more:
                 break
@@ -398,7 +437,7 @@ class Session:
             first_audio = first_audio or spoken
             if not calls:
                 break
-            await self.call_tools(calls)
+            await self.call_tools(calls, logged)
         await self.send({"serverContent": {"turnComplete": True}})
         handle = self.id + uuid.uuid4().hex
         self.sessions[handle] = self.messages
@@ -537,7 +576,18 @@ class Session:
         log(self.id, f"said: {sentence}")
         return sent_at
 
-    async def call_tools(self, calls: list[dict]) -> None:
+    async def call_tools(self, calls: list[dict], logged: bool = False) -> None:
+        """Send the calls to CodeTrial and wait for its answers. With the
+        request already logged by the shim, the model's own requested log_hint
+        is answered here: sent on, the one request would count twice."""
+        if logged:
+            for call in [call for call in calls if self.is_requested_hint(call)]:
+                calls.remove(call)
+                log(self.id, "tool call: log_hint already made for this request, not sent")
+                self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(
+                    {"result": "Already recorded for this request; answer from the result above."})})
+            if not calls:
+                return
         loop = asyncio.get_running_loop()
         for call in calls:
             self.tool_waiters[call["id"]] = loop.create_future()
@@ -554,6 +604,15 @@ class Session:
             finally:
                 self.tool_waiters.pop(call["id"], None)
             self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(response)})
+
+    @staticmethod
+    def is_requested_hint(call: dict) -> bool:
+        if call["name"] != "log_hint":
+            return False
+        try:
+            return bool(json.loads(call["arguments"] or "{}").get("requested"))
+        except json.JSONDecodeError:
+            return False
 
     def on_tool_response(self, message: dict) -> None:
         for response in message.get("functionResponses", []):
