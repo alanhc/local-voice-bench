@@ -1,0 +1,6 @@
+# Keep clients off public STUN: with no stun_servers LiveKit hands every
+# participant Google's and Twilio's. Nothing listens here, and media goes
+# over 127.0.0.1 anyway.
+rtc:
+  stun_servers:
+    - 127.0.0.1:3478

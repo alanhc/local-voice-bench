@@ -67,7 +67,7 @@ human speech.
 ### Run one yourself
 
 ```bash
-~/.local/livekit/livekit-server --dev --bind 127.0.0.1 --node-ip 127.0.0.1 &
+~/.local/livekit/livekit-server --dev --config livekit-local.yaml --bind 127.0.0.1 --node-ip 127.0.0.1 &
 source env.sh && .venv/bin/python live_shim.py --listen 127.0.0.1:8191 --llm http://127.0.0.1:8180 &
 # in the codetrial-voice worktree, config/codetrial.env.local holding
 # LIVEKIT_URL=ws://127.0.0.1:7880, LIVEKIT_API_KEY=devkey,
