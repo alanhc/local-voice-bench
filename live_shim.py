@@ -55,6 +55,16 @@ BARGE_FRAMES = 6
 # one turn instead of two back to back. A bound against a stuck microphone, not
 # a measure of a sentence: eight seconds cut off a nine-second answer.
 MERGE_WAIT = 30.0
+# Once the candidate has been silent this long, the reply is prepared in the
+# background while the configured silence runs out, so it can go out the moment
+# it does. Thinking pauses are longer than this, which is what the configured
+# silence is for; this only decides when to start working, never when to speak.
+SPECULATE_MS = 600
+# A sentence sharing this much of its words with one already said in the
+# interview is held back. gemma-4-12b said the same two sentences fifty times
+# each in an eleven-minute run, against a prompt that forbids it.
+DUPLICATE_OVERLAP = 0.8
+RECENT_SAID = 60
 # Always given to whisper beside the problem's own vocabulary, which is its
 # title and the starter's identifiers. Without them "O of n squared" came back
 # as "O ,".
@@ -143,6 +153,8 @@ class Session:
         self.played: list[list] = []
         self.barge_frames = 0
         self.transcribing = 0
+        self.spec: asyncio.Task | None = None
+        self.said: list[set[str]] = []
         # VAD
         self.vad_state = np.zeros((2, 1, 128), dtype=np.float32)
         self.vad_context = np.zeros(VAD_CONTEXT, dtype=np.float32)
@@ -229,31 +241,76 @@ class Session:
             self.silent_frames = 0
             return
         self.utterance.append(frame)
-        self.silent_frames = 0 if speech else self.silent_frames + 1
-        if self.silent_frames * FRAME * 1000 / IN_RATE >= self.silence_ms:
+        if speech:
+            if self.spec is not None:
+                # They went on: what was prepared answers the wrong sentence.
+                self.spec.cancel()
+                self.spec = None
+            self.silent_frames = 0
+        else:
+            self.silent_frames += 1
+        silent_ms = self.silent_frames * FRAME * 1000 / IN_RATE
+        if self.spec is None and not speech and SPECULATE_MS <= silent_ms < self.silence_ms:
+            self.spec = asyncio.create_task(self.speculate(np.concatenate(self.utterance)))
+        if silent_ms >= self.silence_ms:
             audio = np.concatenate(self.utterance)
             self.utterance, self.pre_roll = [], []
-            asyncio.create_task(self.on_utterance(audio))
+            spec, self.spec = self.spec, None
+            asyncio.create_task(self.on_utterance(audio, spec))
 
-    async def on_utterance(self, audio: np.ndarray) -> None:
+    async def speculate(self, audio: np.ndarray) -> dict:
+        """Everything a reply needs, worked out while the configured silence
+        runs: the transcript, the model's answer, and its audio. Nothing is
+        sent. A tool call is only decided here, never made, since tools have
+        effects (a hint is counted) that a sentence the candidate goes on with
+        must not leave behind."""
+        started = time.perf_counter()
+        async with self.models.gpu:
+            transcript = await asyncio.to_thread(self.models.transcribe, audio, self.hotwords)
+        result = {"transcript": transcript, "stt_ms": 1000 * (time.perf_counter() - started)}
+        if not transcript or self.busy or not self.inputs.empty():
+            return result
+        base = len(self.messages)
+        content, calls = await self.complete(self.messages + [{"role": "user", "content": transcript}])
+        sentences = self.trim_repeats(self.sentences(content))
+        prepared = []
+        for sentence in sentences:
+            async with self.models.gpu:
+                prepared.append((sentence, await asyncio.to_thread(self.models.speak, sentence)))
+        result.update(base=base, sentences=prepared, calls=calls, ready_ms=1000 * (time.perf_counter() - started))
+        return result
+
+    async def on_utterance(self, audio: np.ndarray, spec: asyncio.Task | None = None) -> None:
         heard_at = time.perf_counter()
+        prepared = None
         self.transcribing += 1
         try:
-            async with self.models.gpu:
-                text = await asyncio.to_thread(self.models.transcribe, audio, self.hotwords)
+            if spec is not None:
+                try:
+                    prepared = await spec
+                except Exception as error:
+                    log(self.id, f"speculation failed: {type(error).__name__}: {error}")
+            text = prepared["transcript"] if prepared else None
+            if text is None:
+                async with self.models.gpu:
+                    text = await asyncio.to_thread(self.models.transcribe, audio, self.hotwords)
+            if not text:
+                return
+            ahead = " (prepared during the silence)" if prepared and "sentences" in prepared else ""
+            log(self.id, f"heard ({len(audio) / IN_RATE:.1f}s, {1000 * (time.perf_counter() - heard_at):.0f} ms){ahead}: {text}")
+            await self.send({"serverContent": {"inputTranscription": {"text": text}}})
+            await self.inputs.put((text, heard_at, prepared if ahead else None))
         finally:
+            # Only once the words are queued: a turn waiting to merge them
+            # reads this count, and dropping it first let the turn start
+            # without them.
             self.transcribing -= 1
-        if not text:
-            return
-        log(self.id, f"heard ({len(audio) / IN_RATE:.1f}s, {1000 * (time.perf_counter() - heard_at):.0f} ms): {text}")
-        await self.send({"serverContent": {"inputTranscription": {"text": text}}})
-        await self.inputs.put((text, heard_at))
 
     # --- turns --------------------------------------------------------------
 
     async def turns(self) -> None:
         while True:
-            text, started = await self.inputs.get()
+            text, started, prepared = await self.inputs.get()
             # A candidate mid-sentence is finishing what this turn should
             # answer: wait for their words and take everything waiting as one
             # input, the way Live reads text and audio as one stream.
@@ -262,13 +319,14 @@ class Session:
                 await asyncio.sleep(0.05)
             merged = 1
             while not self.inputs.empty():
-                more, more_started = self.inputs.get_nowait()
+                more, more_started, _ = self.inputs.get_nowait()
                 text, started, merged = f"{text}\n{more}", max(started, more_started), merged + 1
             if merged > 1:
+                prepared = None  # it answered only part of what is now asked
                 log(self.id, f"answering {merged} inputs as one turn")
             self.busy = True
             self.played = []
-            self.turn_task = asyncio.create_task(self.turn(text, started))
+            self.turn_task = asyncio.create_task(self.turn(text, started, prepared))
             await asyncio.wait({self.turn_task})
             if not self.turn_task.cancelled() and self.turn_task.exception():
                 error = self.turn_task.exception()
@@ -318,13 +376,26 @@ class Session:
                     self.messages.append({"role": "tool", "tool_call_id": call["id"],
                                           "content": json.dumps({"result": "interrupted before it was answered"})})
 
-    async def turn(self, text: str, started: float) -> None:
+    async def turn(self, text: str, started: float, prepared: dict | None = None) -> None:
         self.messages.append({"role": "user", "content": text})
         first_audio = None
+        more = True
+        usable = prepared is not None and prepared.get("base") == len(self.messages) - 1
+        if usable:
+            # Worked out during the silence against this same history: send it.
+            for sentence, audio in prepared["sentences"]:
+                at = await self.emit(sentence, audio)
+                first_audio = first_audio or at
+            calls = prepared["calls"]
+            self.record([sentence for sentence, _ in prepared["sentences"]], calls)
+            more = bool(calls)
+            if calls:
+                await self.call_tools(calls)
         for _ in range(4):
-            spoken, calls = await self.generate(started, lambda: first_audio)
-            if spoken and first_audio is None:
-                first_audio = spoken
+            if not more:
+                break
+            spoken, calls = await self.generate()
+            first_audio = first_audio or spoken
             if not calls:
                 break
             await self.call_tools(calls)
@@ -333,17 +404,92 @@ class Session:
         self.sessions[handle] = self.messages
         await self.send({"sessionResumptionUpdate": {"newHandle": handle, "resumable": True}})
         if first_audio:
-            log(self.id, f"turn done, first audio {1000 * (first_audio - started):.0f} ms after the input was complete")
+            how = "prepared" if usable else "generated"
+            log(self.id, f"turn done ({how}), first audio {1000 * (first_audio - started):.0f} ms after the input was complete")
 
-    async def generate(self, started, first_audio):
-        """Stream one completion, speaking each sentence as it completes.
-        Returns when the first audio went out, and any tool calls."""
-        text, spoken_at, calls = "", None, {}
-        buffer = ""
-        async with self.http.stream("POST", f"{self.args.llm}/v1/chat/completions", json={
-            "messages": self.messages, "tools": self.tools, "temperature": 0.7, "max_tokens": 400,
-            "stream": True, "stop": [THOUGHT_LOOP], "chat_template_kwargs": {"enable_thinking": False},
-        }) as response:
+    def request(self, messages: list[dict], stream: bool = False) -> dict:
+        return {"messages": messages, "tools": self.tools, "temperature": 0.7, "max_tokens": 400,
+                "stream": stream, "stop": [THOUGHT_LOOP], "chat_template_kwargs": {"enable_thinking": False}}
+
+    async def complete(self, messages: list[dict]) -> tuple[str, list[dict]]:
+        response = await self.http.post(f"{self.args.llm}/v1/chat/completions", json=self.request(messages))
+        response.raise_for_status()
+        message = response.json()["choices"][0]["message"]
+        calls = [
+            {"id": call.get("id") or f"call-{uuid.uuid4().hex[:8]}", "name": call["function"]["name"],
+             "arguments": call["function"].get("arguments") or "{}"}
+            for call in message.get("tool_calls") or []
+        ]
+        return THOUGHT_MARKUP.sub("", message.get("content") or "").strip(), calls
+
+    @staticmethod
+    def sentences(text: str) -> list[str]:
+        return [part.strip() for part in SENTENCE_END.split(THOUGHT_MARKUP.sub("", text)) if part.strip()]
+
+    @staticmethod
+    def words(sentence: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9']+", sentence.lower()))
+
+    def is_repeat(self, sentence: str) -> bool:
+        """Close to something already said in this interview. Short sentences
+        ("Gotcha.", "Take your time.") are left alone: saying them again is
+        how people talk."""
+        words = self.words(sentence)
+        if len(words) < 5:
+            return False
+        return any(len(words & said) / len(words | said) >= DUPLICATE_OVERLAP for said in self.said[-RECENT_SAID:])
+
+    def trim_repeats(self, sentences: list[str]) -> list[str]:
+        """Drop the sentences that repeat earlier ones, but only when something
+        new is left to say. A reply made only of repeats is said anyway: asked
+        to regenerate with a note, gemma read the note aloud, and answering a
+        request with silence is worse than answering it again."""
+        fresh = [sentence for sentence in sentences if not self.is_repeat(sentence)]
+        held = len(sentences) - len(fresh)
+        if held and fresh:
+            log(self.id, f"held back {held} repeated sentence(s)")
+        return fresh or sentences
+
+    def record(self, spoken: list[str], calls: list[dict]) -> None:
+        message = {"role": "assistant", "content": " ".join(spoken)}
+        for call in calls:
+            call["id"] = call["id"] or f"call-{uuid.uuid4().hex[:8]}"
+        if calls:
+            message["tool_calls"] = [
+                {"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": call["arguments"] or "{}"}}
+                for call in calls
+            ]
+        self.messages.append(message)
+        for entry in self.played:
+            if entry[3] is None:
+                entry[3] = len(self.messages) - 1
+
+    async def generate(self):
+        """Stream one completion, speaking each new sentence as it completes.
+        A sentence repeating an earlier one waits: if anything new follows it
+        is dropped, and if nothing does it is said after all (see
+        `trim_repeats`). Returns when the first audio went out, and any tool
+        calls."""
+        spoken_at, calls, buffer = None, {}, ""
+        spoken: list[str] = []
+        held: list[str] = []
+
+        async def say(sentence: str) -> None:
+            nonlocal spoken_at
+            async with self.models.gpu:
+                audio = await asyncio.to_thread(self.models.speak, sentence)
+            at = await self.emit(sentence, audio)
+            spoken.append(sentence)
+            spoken_at = spoken_at or at
+
+        async def take(sentence: str) -> None:
+            if self.is_repeat(sentence):
+                held.append(sentence)
+            else:
+                await say(sentence)
+
+        async with self.http.stream("POST", f"{self.args.llm}/v1/chat/completions",
+                                    json=self.request(self.messages, stream=True)) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if not line.startswith("data: ") or line == "data: [DONE]":
@@ -356,38 +502,24 @@ class Session:
                     slot["name"] += function.get("name") or ""
                     slot["arguments"] += function.get("arguments") or ""
                 if delta.get("content"):
-                    text += delta["content"]
                     buffer += delta["content"]
-                    *sentences, buffer = SENTENCE_END.split(THOUGHT_MARKUP.sub("", buffer)) or [""]
-                    for sentence in sentences:
-                        at = await self.say(sentence)
-                        spoken_at = spoken_at or at
+                    *done, buffer = SENTENCE_END.split(THOUGHT_MARKUP.sub("", buffer)) or [""]
+                    for sentence in done:
+                        if sentence.strip():
+                            await take(sentence.strip())
         tail = THOUGHT_MARKUP.sub("", buffer).strip()
         if tail:
-            at = await self.say(tail)
-            spoken_at = spoken_at or at
-        clean = THOUGHT_MARKUP.sub("", text).strip()
-        message = {"role": "assistant", "content": clean}
+            await take(tail)
         calls = [call for call in calls.values() if call["name"]]
-        for index, call in enumerate(calls):
-            call["id"] = call["id"] or f"call-{uuid.uuid4().hex[:8]}"
-        if calls:
-            message["tool_calls"] = [
-                {"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": call["arguments"] or "{}"}}
-                for call in calls
-            ]
-        self.messages.append(message)
-        for entry in self.played:
-            if entry[3] is None:
-                entry[3] = len(self.messages) - 1
+        if held and not spoken and not calls:
+            for sentence in held:
+                await say(sentence)
+        elif held:
+            log(self.id, f"held back {len(held)} repeated sentence(s)")
+        self.record(spoken, calls)
         return spoken_at, calls
 
-    async def say(self, sentence: str) -> float | None:
-        sentence = sentence.strip()
-        if not sentence:
-            return None
-        async with self.models.gpu:
-            audio = await asyncio.to_thread(self.models.speak, sentence)
+    async def emit(self, sentence: str, audio: np.ndarray) -> float:
         sent_at = time.perf_counter()
         await self.send({"serverContent": {"outputTranscription": {"text": sentence + " "}}})
         for start in range(0, len(audio), AUDIO_CHUNK):
@@ -400,6 +532,7 @@ class Session:
         start = max(self.speaking_until, time.monotonic())
         self.speaking_until = start + len(audio) / OUT_RATE
         self.played.append([sentence, start, self.speaking_until, None])
+        self.said.append(self.words(sentence))
         log(self.id, f"said: {sentence}")
         return sent_at
 
@@ -442,7 +575,7 @@ class Session:
                         await self.on_audio(base64.b64decode(realtime["audio"]["data"]))
                     if realtime.get("text"):
                         log(self.id, f"event: {realtime['text'][:100]!r}")
-                        await self.inputs.put((realtime["text"], time.perf_counter()))
+                        await self.inputs.put((realtime["text"], time.perf_counter(), None))
                 elif "toolResponse" in message:
                     self.on_tool_response(message["toolResponse"])
         except websockets.ConnectionClosed:

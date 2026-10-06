@@ -104,6 +104,38 @@ as hotwords.
   than a guess at a sentence; and with no hotwords "O of n squared" came back
   as "O ,".
 
+## Stage 3: replies prepared during the silence (2026-10-06)
+
+Once the candidate has been quiet for 600 ms the shim transcribes, asks the
+model and synthesizes the reply in the background, sending nothing; when the
+configured silence (3,000 ms in CodeTrial) runs out it sends what is ready. If
+they speak again first, the work is thrown away. A tool call is only decided
+in advance, never made, since tools have effects. Sentences that repeat earlier
+ones are dropped when the reply has something new; a reply made only of
+repeats is said anyway.
+
+Eleven minutes each through CodeTrial (`soak`, `analyze_log.py`):
+
+| | Stage 2 | Stage 3, same request every 12 s | Stage 3, five different lines |
+|---|---|---|---|
+| turns prepared during the silence | 0 of 56 | 55 of 56 | 51 of 52 |
+| first audio after the silence ends, median | 1,078 ms | **0 ms** | **0 ms** |
+| p90 / max | 1,424 / 2,232 ms | 0 / 1,609 ms | 1,140 / 1,589 ms |
+| sentences that nearly repeat an earlier one | 88% | 88% | 43% |
+| failures | 0 | 0 | 0 |
+
+What is left is the configured silence itself, which Gemini waits too; with
+the reply ready when it starts, an operator could now lower
+`GEMINI_SILENCE_MS` without the candidate waiting on the pipeline.
+
+Repetition is not fixed. gemma-4-12b answers a repeated request with nearly
+the same words each time, and asked to regenerate with a note listing what it
+had said, it read the note aloud ("[Platform note: you already said ...]"),
+so that was taken out. Dropping repeats outright made the interviewer go
+silent on 26 of 55 requests, which is worse, so a reply that is all repeats is
+now said. The remaining fix is a model that follows "never say the same thing
+twice"; there is no VRAM left beside gemma to try one alongside it.
+
 ## Caveats
 
 - The candidate speech is Kokoro-synthesized: clean, no accent, no room noise.
