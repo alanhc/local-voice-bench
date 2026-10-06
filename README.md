@@ -61,8 +61,8 @@ Found on the way:
   calls, whole-sentence TTS before sending, and one GPU lock for all three
   models.
 
-Not done in stage 1: barge-in (the microphone is ignored while the
-interviewer speaks), latency work, any real human speech.
+Not done in stage 1: barge-in (stage 2, below), latency work, any real
+human speech.
 
 ### Run one yourself
 
@@ -79,6 +79,30 @@ CXX=$HOME/.local/clang-webrtc/bin/clang++ cargo run -- web
 
 The report also needs CodeTrial's `scripts/gemini-shim.py --thinking off` on
 8190 in front of the same llama-server.
+
+## Stage 2: barge-in and merged inputs (2026-10-06)
+
+Speech lasting about 190 ms while the interviewer has the floor (generating,
+or its audio still playing out) stops the turn, sends `interrupted`, and keeps
+in the history only the sentences that had started playing. A platform event
+arriving while the candidate is mid-sentence waits for their words and is
+answered with them as one turn. Whisper always gets common complexity phrases
+as hotwords.
+
+- `smoke_barge.py`, straight to the shim: `interrupted` 384 ms after the
+  candidate started over the greeting, 2 sentences kept and 2 cut, then a reply
+  to their request; a nudge sent one second into a 9.6 s answer was answered
+  with it as one turn, first audio 0.71 s.
+- `soak` through CodeTrial, the candidate speaking every 12 s for 11 minutes:
+  55 utterances heard, 55 interruptions (54 over the last sentence still
+  playing, one mid-reply cutting two unplayed sentences), 56 turns, none
+  failed, first audio a median 1.08 s and at most 2.23 s. What the shim cannot
+  see is the browser actually stopping playback; what it can see is that every
+  interruption was followed by a normal turn, so CodeTrial did not stall on one.
+- Two fixes on the way: the merge wait was eight seconds and a nine-second
+  answer outlasted it, so it is now a 30 s bound on a stuck microphone rather
+  than a guess at a sentence; and with no hotwords "O of n squared" came back
+  as "O ,".
 
 ## Caveats
 
