@@ -1,0 +1,37 @@
+[0;93m2026-10-06 21:26:10.880464593 [W:onnxruntime:Default, scatter_nd.h:50 ScatterNDWithAtomicReduction] ScatterND with reduction=='none' only guarantees to be correct if indices are not duplicated.[m
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+kokoro load 1.8s on CUDAExecutionProvider
+TTS, interviewer voice (am_michael), streamed:
+   21 chars,  1.7s of speech
+     first chunk  median      35 ms   p90      59 ms
+     whole reply  median      35 ms   p90      59 ms   (real-time factor 0.02)
+   85 chars,  5.6s of speech
+     first chunk  median      80 ms   p90      95 ms
+     whole reply  median      80 ms   p90      95 ms   (real-time factor 0.01)
+  108 chars,  6.6s of speech
+     first chunk  median      92 ms   p90     104 ms
+     whole reply  median      92 ms   p90     104 ms   (real-time factor 0.01)
+  140 chars,  8.6s of speech
+     first chunk  median     114 ms   p90     134 ms
+     whole reply  median     114 ms   p90     134 ms   (real-time factor 0.01)
+whisper load 378.4s
+STT, whisper large-v3-turbo int8_float16:
+  [greedy]
+     1.8s clip  median      82 ms   p90      93 ms  exact
+     1.7s clip  median      83 ms   p90      93 ms  exact
+     6.7s clip  median     116 ms   p90     132 ms  exact
+     5.4s clip  median     111 ms   p90     116 ms  differs
+        said : Could I use a hash map to store each value's index as I go, so each lookup is O of one?
+        heard: Could I use a hash map to store each values index as I go, so each lookup is O of 1?
+     8.4s clip  median     122 ms   p90     123 ms  exact
+    technical terms heard: 5/6
+  [greedy + hotwords]
+     1.8s clip  median      93 ms   p90      96 ms  exact
+     1.7s clip  median      83 ms   p90      84 ms  exact
+     6.7s clip  median     117 ms   p90     129 ms  exact
+     5.4s clip  median     103 ms   p90     109 ms  differs
+        said : Could I use a hash map to store each value's index as I go, so each lookup is O of one?
+        heard: Could I use a hash map to store each values index as I go, so each lookup is O of one?
+     8.4s clip  median     114 ms   p90     128 ms  exact
+    technical terms heard: 6/6
+Silero VAD on CPU: 261 frames of 32 ms, median 62 us per frame

@@ -1,0 +1,16 @@
+server: gemma-4-12b-it-Q4_K_M.gguf, n_ctx per slot 32768, slots 4
+interviewer instructions: 20910 chars, 4759 tokens
+
+cold (instructions not cached):
+  first token     median   2009 ms   p90   2120 ms
+  first sentence  median   2066 ms   p90   2081 ms
+
+warm (same session, next candidate turn):
+  first token     median    213 ms   p90    214 ms
+  first sentence  median    334 ms   p90    358 ms
+  e.g. 'I see. Could you tell me what you think the constraints and edge cases are for this problem?'
+
+hint request (tool round trips inside the wait):
+  first token     median    545 ms   p90    642 ms
+  first sentence  median    909 ms   p90   1072 ms
+  tools called    log_hint, log_hint, log_hint, log_hint, log_hint

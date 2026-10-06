@@ -1,0 +1,1 @@
+export LD_LIBRARY_PATH=$HOME/workspace/local-voice-bench/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:$HOME/workspace/local-voice-bench/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}
