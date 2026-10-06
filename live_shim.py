@@ -79,8 +79,13 @@ INTERVIEW_HOTWORDS = [
 # model speaks, and the model answers from its result.
 HINT_REQUEST = re.compile(
     r"\b(?:(?:can|could|may) (?:i|you|we) (?:get|have|give(?: me)?|use)"
-    r"|(?:give|show) me|i(?:'d| would)? (?:like|want|need)|i could use|is there|got|any(?:thing)?(?: like)?)"
-    r"(?: (?:a|an|another|one|one more|some|any|a little|a small|more|other))*"
+    r"|(?:give|show) me|i(?:'d| would)? (?:like|want|need)|i could use|is there|any(?:thing)?(?: like)?)"
+    # Up to three words before the noun: "a", "one more", "one last", "a
+    # quick little". A list of them missed "one last hint" in the first run
+    # with a person. "the", "to" and the like mean the hint is one already
+    # given ("I want to understand the hint"), and HINT_DECLINED keeps "I
+    # don't need a hint" out.
+    r"(?: (?!(?:the|to|that|this|your|you|my)\b)[a-z']+){0,3}"
     r" (?:hint|clue|nudge)s?\b"
     r"|\b(?:another|one more|a) (?:hint|clue)(?:,)? please\b|^\s*(?:a |another )?hint\??\s*$",
     re.I,
