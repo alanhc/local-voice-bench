@@ -181,8 +181,8 @@ first version of the script counted as a request because it mentions hints):
 
 | | before | after |
 |---|---|---|
-| ordinary interview, requests logged | 2 of 4 | **4 of 4** |
-| 30x same request, requests logged | 2 of 30 | **30 of 30** |
+| ordinary interview, requests logged | 3 of 4 | **4 of 4** |
+| 30x same request, requests logged | 3 of 30 | **30 of 30** |
 | counted twice / counted unasked | not measured | 0 / 0 |
 | 30x same request, near-repeats | 72% | 49% |
 
